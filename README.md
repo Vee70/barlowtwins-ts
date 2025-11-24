@@ -4,7 +4,7 @@
   <img src="fig/barlowtwins_ts.png">
 </p>
 
-PyTorch implementation of "Self-Supervised Learning for Time Series Classification via Redundancy Reduction and Wavelet-based Data Augmentation"
+PyTorch implementation of "Self-Supervised Learning for Time Series Classification via Redundancy Reduction and Wavelet-based Data Augmentation".
 
 
 ## Requirements
@@ -16,7 +16,7 @@ Experiments were done with Python 3.12.4 with the following libraries:
 * pywavelet==1.9.0
 * scikit-learn==1.6.1
 * scipy==1.15.3
-* torch==2.6
+* torch==2.6.0
 
 
 ## Datasets
