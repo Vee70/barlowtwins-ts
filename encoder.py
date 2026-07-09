@@ -1,5 +1,4 @@
 import math
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.parametrizations import weight_norm
@@ -42,20 +41,18 @@ class CausalConvBlock(nn.Module):
         kernel_size,
         dilation,
         activation,
-        dropout=0.0,
+        dropout=0.1,
     ):
         super().__init__()
 
         self.conv_block = nn.Sequential(
             CausalConv1d(in_channels, out_channels, kernel_size, dilation),
             activation,
-            nn.Dropout(dropout),
             CausalConv1d(out_channels, out_channels, kernel_size, dilation),
             activation,
             nn.Dropout(dropout),
         )
 
-        # ensure that input having the same size for residual connection
         self.shortcut = nn.Conv1d(
             in_channels, out_channels, kernel_size=1,
         ) if in_channels != out_channels else None
@@ -66,17 +63,17 @@ class CausalConvBlock(nn.Module):
 
 
 class CausalConvEncoder(nn.Module):
-    """ Input:  (N, L, C_in)
-        Output: (N, L, C_out)
+    """ Input:  (N, C_in, L)
+        Output: (N, C_out, L)
     """
     def __init__(
         self,
         in_dim,
         out_dim,
-        hidden_dim,
-        kernel_size,
-        n_blocks,
-        activation,
+        hidden_dim=80,
+        kernel_size=3,
+        n_blocks=6,
+        activation="elu",
         dropout=0.1,
         max_dilation=None,
     ):
@@ -101,7 +98,7 @@ class CausalConvEncoder(nn.Module):
         ])
 
     def forward(self, x):
-        return self.conv_blocks(x.transpose(1, 2)).transpose(1, 2)
+        return self.conv_blocks(x)
 
 
 class MLPHead(nn.Module):

@@ -1,98 +1,80 @@
 import json
-import random
 import numpy as np
+import random
 import torch
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 
-class TSDataset(torch.utils.data.Dataset):
-    def __init__(self, data):
-        """ data shape: (n_samples, length, features)
-        """
-        self.data = torch.from_numpy(data).float()
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, i):
-        return self.data[i]
-
-
-def load_benchmark_data(data_path):
-    data_name = data_path.split("/")[-1].split(".")[0]
-    # data shape: (n_samples, features, length)
-    data = np.load(data_path, allow_pickle=True).item()
-    # transpose to (n_samples, length, features)
+def load_benchmark_data(path):
+    # shape: (n_sample, channels, length)
+    data = np.load(path, allow_pickle=True).item()
     train_data, train_label = data["train_data"], data["train_label"]
     test_data, test_label = data["test_data"], data["test_label"]
 
-    # check if the data contain validation set
-    #  if true, merge training and validation sets
-    if "val_data" in data and data_name != "Sleep":
+    # check if data contains validation set. if true, merge training and validation set
+    name = path.split("/")[-1].split(".")[0].lower()
+    if "val_data" in data and name != "sleep":
         val_data, val_label = data["val_data"], data["val_label"]
-        train_data = np.concatenate([train_data, val_data], axis=0)
-        train_label = np.concatenate([train_label, val_label], axis=0)
+        train_data = np.concatenate([train_data, val_data])
+        train_label = np.concatenate([train_label, val_label])
 
     # label encoder (only for "USC_HAD")
-    if data_name == "USC_HAD":
-        le = LabelEncoder()
-        train_label = le.fit_transform(train_label)
-        test_label = le.transform(test_label)
+    if name == "usc_had":
+        label_encoder = LabelEncoder()
+        train_label = label_encoder.fit_transform(train_label)
+        test_label = label_encoder.transform(test_label)
 
-    # transpose to (n samples, length, features)
-    return (
-        train_data.transpose(0, 2, 1),
-        train_label,
-        test_data.transpose(0, 2, 1),
-        test_label,
-    )
+    return train_data, train_label, test_data, test_label
 
 def get_labeled_data(X, y, n=1, seed=0):
+    """
+    sample a small subset of data for linear probing
+    (the return data dist is uniform)
+    """
     random.seed(seed)
     np.random.seed(seed)
-    X_s, y_s = [], []
-    for c in np.unique(y):
-        X_s.append(np.random.permutation(X[y == c])[:n])
-        y_s.append(y[y == c][:n])
-    return np.concatenate(X_s, axis=0), np.concatenate(y_s, axis=0)
 
-def get_labeled_data_ratio(
-    X_train_all,
-    y_train_all,
-    ratios=[0.2, 0.15, 0.10, 0.05, 0.01],
-    seed=0,
-):
+    _X, _y = [], []
+    for c in np.unique(y):
+        _X.append(np.random.permutation(X[y == c])[:n])
+        _y.append(y[y == c][:n])
+
+    return np.concatenate(_X), np.concatenate(_y)
+
+def get_labeled_data_incemental(samples, labels, percentage=[0.1, 0.05, 0.01], seed=0):
+    """
+    Incrementally sample small subsets of the data.
+    `percentage=[0.1, 0.05, 0.01]` -> sample 10%, 5% and 1% of the data
+     and store them in `labeled_ds`.
+     (the distribution is roughly the same as the original data)
+
+    Use `labeled_ds["1%"] (or labeled_ds["5%"]) to access the data.
+    """
     random.seed(seed)
     np.random.seed(seed)
 
     labeled_ds = {}
-    train_data, train_label = X_train_all, y_train_all
-    prev_ratio = 1.0
+    X, y = samples, labels
+    prev_p = 1.0
 
-    for ratio in ratios:
-        x, _, y, _ = train_test_split(
-            train_data, train_label,
-            train_size=ratio/prev_ratio,
-            stratify=train_label,
-            random_state=seed,
+    for p in percentage:
+        _X, _, _y, _ = train_test_split(
+            X, y, train_size=p/prev_p, stratify=y, random_state=seed,
         )
-        labeled_ds[int(ratio*100)] = {"X": x, "y": y}
-        train_data, train_label = x, y
-        prev_ratio = ratio
+        labeled_ds[f"{int(p*100)}%"] = {"X": _X, "y": _y}
+        X, y, prev_p = _X, _y, p
 
     return labeled_ds
+
 
 def save_model(model, args, save_path):
     save_path = Path(save_path)
     # create dir for storing saved models
     Path.mkdir(save_path, exist_ok=True, parents=True)
     # save trained encoder and output projector
-    if isinstance(model.encoder, torch.optim.swa_utils.AveragedModel):
-        torch.save(model.encoder.module.state_dict(), f=save_path/"encoder")
-    else:
-        torch.save(model.encoder.state_dict(), f=save_path/"encoder")
+    torch.save(model.encoder.state_dict(), f=save_path/"encoder")
     torch.save(model.proj_head.state_dict(), f=save_path/"proj_head")
     # save hyperparams
     with open(save_path/"encoder_args.json", "w") as f:

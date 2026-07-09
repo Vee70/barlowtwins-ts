@@ -1,10 +1,8 @@
 import pywt
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
@@ -12,13 +10,19 @@ from sklearn.multiclass import OneVsRestClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+
 ### Local scripts
 from loss import BarlowTwinsLoss
-from augmentations import crop, generate_mask_wavelet_args, mask_wavelet, select_sub_series
-from utils import TSDataset
+from augmentations import (
+    generate_mask_wavelet_args,
+    mask_wavelet,
+    rand_crop,
+    select_sub_series,
+)
 
 
 class TSReprLearner:
+
     def __init__(
         self,
         encoder,
@@ -27,37 +31,34 @@ class TSReprLearner:
         lambda_coeff=1e-3,
         device=torch.device("cpu"),
     ):
-
         self.encoder = encoder.to(device)
         self.proj_head = proj_head.to(device)
 
         self.optimizer = torch.optim.Adam(
-            list(self.encoder.parameters()) + list(self.proj_head.parameters()),
+            list(self.encoder.parameters()) + list(self.proj_head.parameters())
         )
-
         self.lr = lr
         self.lambda_coeff = lambda_coeff
         self.device = device
 
     def maxpool(self, x):
-        """ Apply max_pool over time dimension
-            Input:  (N, L, C_in)
+        """ Input:  (N, C_in, L)
             Output: (N, C_out)
         """
-        return F.max_pool1d(x.transpose(1, 2), kernel_size=x.size(1)).squeeze(-1)
+        return F.max_pool1d(x, kernel_size=x.size(2)).squeeze(-1)
 
-    def encode(self, data_npy, batch_size=1):
-        """ Input:  (N, L, C_in)
+    def encode(self, data_npy, batch_size=16):
+        """ Input:  (N, C_in, L)
             Output: (N, C_out)
         """
         data_loader = DataLoader(
-            TSDataset(data_npy),
+            UnlabeledDataset(data_npy),
             batch_size=batch_size,
         )
         self.encoder.eval()
         with torch.no_grad():
             output = [ self.maxpool(self.encoder(x.to(self.device)))
-                          for x in data_loader ]
+                         for x in data_loader ]
         return torch.cat(output, dim=0).cpu().numpy()
 
     def pretrain(
@@ -65,67 +66,60 @@ class TSReprLearner:
         train_data_npy,
         n_epochs,
         batch_size,
-        l_min,
-        l_max,
-        mask_prob,
-        max_dec_lv,
-        wavelets,
+        l_min=0.5,
+        l_max=1.0,
+        mask_prob=0.1,
+        max_dec_lv=4,
+        wavelets=["haar", "db2"],
     ):
-        ### Barlow Twins Loss
         self.loss_fn = BarlowTwinsLoss(
-            batch_size,
-            lambda_coeff=self.lambda_coeff,
+            batch_size, lambda_coeff=self.lambda_coeff,
         )
 
-        ### shape: (N, L, C)
         train_loader = DataLoader(
-            TSDataset(train_data_npy),
+            UnlabeledDataset(train_data_npy),
             batch_size=batch_size,
             shuffle=True,
             drop_last=True,
         )
-        n_samples, seq_len, _ = train_data_npy.shape
 
-        ### learning rate scheduler
+        n_samples, _, seq_len = train_data_npy.shape
         n_iters_per_epoch = int(np.ceil(n_samples / batch_size))
         lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=self.lr,
             epochs=n_epochs,
             steps_per_epoch=n_iters_per_epoch,
-            three_phase=False,
         )
 
-        ### params for `generate_mask_wavelet_args`
+        # params for `generate_mask_wavelet_args`
         dec_lvs = {
             wavelets[0]: pywt.dwt_max_level(seq_len, wavelets[0]),
             wavelets[1]: pywt.dwt_max_level(seq_len, wavelets[1]),
         }
 
-        ### training loop
         for epoch in range(n_epochs):
 
             for x_batch in train_loader:
-
-                x_batch = x_batch.to(self.device)
-                self.optimizer.zero_grad()
-
                 ### Data augmentation
                 wavelet1, wavelet2, p1, p2 = generate_mask_wavelet_args(
-                    wavelets, dec_lvs, max_dec_lv, seq_len, mask_prob
+                    wavelets, dec_lvs, max_dec_lv, mask_prob
                 )
                 x1 = mask_wavelet(x_batch, wavelet1, p1)
                 x2 = mask_wavelet(x_batch, wavelet2, p2)
-                x2, x2_start = crop(x2, l_min, l_max)
+                x2, x2_start = rand_crop(x2, l_min, l_max)
 
                 ### Encoding step
-                # encoder output - (N, L, C)
-                x1 = select_sub_series(self.encoder(x1), x2.size(1), x2_start)
-                x2 = self.encoder(x2)
+                # encoder output - (N, C, L)
+                x1 = select_sub_series(
+                    self.encoder(x1.to(self.device)), x2.size(2), x2_start,
+                )
+                x2 = self.encoder(x2.to(self.device))
                 # projhead + maxpool output - (N, C)
                 x1 = self.proj_head(self.maxpool(x1))
                 x2 = self.proj_head(self.maxpool(x2))
 
+                self.optimizer.zero_grad()
                 loss = self.loss_fn(x1, x2)
                 loss.backward()
                 self.optimizer.step()
@@ -133,9 +127,22 @@ class TSReprLearner:
                 lr_scheduler.step()
 
 
+class UnlabeledDataset(torch.utils.data.Dataset):
+    def __init__(self, X):
+        """ X: (n_samples, channels, length)
+        """
+        self.X = torch.from_numpy(X).float()
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, i):
+        return self.X[i]
+
+
 def eval_classification(
     model, X_train, y_train, X_test, y_test,
-    batch_size=256, max_samples=100000, max_iter=1000000, seed=0,
+    batch_size=16, max_samples=100000, max_iter=1000000, seed=0,
 ):
     if X_train.shape[0] > max_samples:
         X_train, _, y_train, _ = train_test_split(
@@ -146,10 +153,9 @@ def eval_classification(
 
     lr = make_pipeline(
         StandardScaler(),
-        OneVsRestClassifier(
-            LogisticRegression(random_state=seed, max_iter=max_iter),
-        ),
+        OneVsRestClassifier(LogisticRegression(random_state=seed, max_iter=max_iter)),
     )
+
     lr.fit(X_train_repr, y_train)
     y_pred = lr.predict(X_test_repr)
 
